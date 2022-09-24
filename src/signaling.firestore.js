@@ -1,77 +1,69 @@
-import { WebRTCBase, WebRTCRole  } from "./webrtc.base";
+/**************************************************************************
+    signaling.firestore.js is
+    Copyright (C) 2022 kymstk <kymstkpm+oss@gmail.com>
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ **************************************************************************/
+
 import { initializeApp } from 'firebase/app';
-import { getFirestore, doc, setDoc, deleteDoc, onSnapshot } from 'firebase/firestore';
-import fbc from './firebaseconfig';
+import { getFirestore, doc, setDoc, deleteDoc, onSnapshot, Timestamp } from 'firebase/firestore';
 
-const offer_collection_name = "sdp_offer";
-const answer_collection_name = "sdp_answer";
+const offer_collection_name = "description_offer";
+const answer_collection_name = "description_answer";
 
-export function offer(key, tracks){
-    const firebase = initializeApp(fbc);
-    const firestore = getFirestore(firebase);
-    const webrtc = new WebRTCBase(WebRTCRole.offer, {
-        async sendOfferSDP(sdp){
-            console.debug('webrtc.firebase: sendOfferSDP called');
-			await setDoc(doc(firestore, offer_collection_name, key), {
-				sdp: sdp
+export function createFirestoreSignaling(role, key, firebaseConfig){
+    const firebase = initializeApp(firebaseConfig);
+    const db = getFirestore(firebase);
+
+    let collection_names = null;
+    if(role.isOffer)
+        collection_names = [offer_collection_name, answer_collection_name];
+    else
+        collection_names = [answer_collection_name, offer_collection_name];
+
+    return {
+        async sendDescription(description){
+            console.debug('firestore signaling: sendOffer called');
+
+			await setDoc(doc(db, collection_names[0], key), {
+				type: description.type,
+                sdp: description.sdp,
+                lifelimit: Timestamp.fromMillis(Date.now() + 86400 * 1000), // 1日後, for TTL
 			});
         },
-    });
+        remoteDescription(){
+            const peerdocument = doc(db, collection_names[1], key);
 
-    const answer_doc = doc(firestore, answer_collection_name, key);
-    const unsubscribe = onSnapshot(answer_doc, (document) => {
-            const data = document.data();
-            console.debug("onSnapshot: ", data);
+            return new Promise((resolve, reject) => {
+                const unsubscribe = onSnapshot(peerdocument, (document) => {
+                    const data = document.data();
+                    console.debug("firestore signaling: snapshot:", data);
 
-            if(!data)
-                return
+                    if(!data)
+                        return
 
-            if(!data['sdp'])
-                return
+                    if( !('type' in data) )
+                        return
+                    if( !('sdp' in data) )
+                        return
 
-            // answer SDP を受信したら、firestore の変更通知を止める
-            unsubscribe();
-            // 受信して用済みなので firestore 上の answer SDP を削除
-            deleteDoc(answerDocument);
+                    unsubscribe(); // firestore の変更通知を止める
+                    deleteDoc(peerdocument); // 受信して用済みなので削除
 
-            webrtc.receivedRemoteSDP(data['sdp']);
-            // この時点で WebRTC の通信が始まって、peer に track が送信される
-	});
-
-    webrtc.startOffer(tracks);
-    return webrtc;
-}
-
-export function answer(key, receivedMediaStreams){
-    const firebase = initializeApp(fbc);
-    const firestore = getFirestore(firebase);
-    const webrtc = new WebRTCBase(WebRTCRole.answer, {
-        async sendAnswerSDP(sdp){
-            console.debug('webrtc.firebase: sendOfferSDP called');
-			await setDoc(doc(firestore, answer_collection_name, key), {
-				sdp: sdp
-			});
+                    resolve({type: data.type, sdp: data.sdp})
+                });
+            });
         },
-        receivedMediaStreams,
-    });
-
-    const offerDocument = doc(firestore, offer_collection_name, key);
-	var unsubscribe = onSnapshot(offerDocument, (document) => {
-		const data = document.data();
-		console.debug("onSnapshot: ", data);
-
-		if(!data)
-			return
-
-		if(!data['sdp'])
-			return
-
-		// offer SDP を受信したら、firestore の変更通知を止める
-		unsubscribe();
-		// 受信して用済みなので firestore 上の offer SDP を削除
-		deleteDoc(offerDocument);
-
-        webrtc.receivedRemoteSDP(data['sdp']);
-		// この時点で受信側の ICE の収集が走り始め、完了したら sendAnswerSDP() がキックされる
-	});
+    };
 }

@@ -1,9 +1,19 @@
 {
-  "name": "webrtc",
-  "version": "0.0.0",
-  "description": "",
-  "main": "index.js",
-  "scripts": {
-  },
-  "author": "",
+    "name": "webrtc",
+    "private": true,
+    "version": "0.1.0",
+    "type": "module",
+    "files": [
+        "src"
+    ],
+    "main": "./src/index.js",
+    "exports": {
+        ".": {
+            "import": "./src/index.js"
+        }
+    },
+    "scripts": {},
+    "dependencies": {
+        "firebase": "^9.10.0"
+    }
 }

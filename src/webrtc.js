@@ -1,9 +1,39 @@
+/**************************************************************************
+    webrtc.js is
+    Copyright (C) 2022 kymstk <kymstkpm+oss@gmail.com>
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ **************************************************************************/
+
 export const WebRTCRole = Object.freeze({
-    offer: Symbol('offer'),
-    answer: Symbol('answer'),
+    offer: Object.freeze({
+        isOffer: true,
+        isAnswer: false,
+    }),
+    answer: Object.freeze({
+        isOffer: false,
+        isAnswer: true,
+    }),
 });
 
-export class WebRTCBase{
+export class WebRTCBase extends RTCPeerConnection{
+    static #sdpdatachannellabel = '__sdp__exchange__';
+    static #sdpdatachanneloptions = {
+        id: 0,
+        negotiated: true,
+    };
+
     /*
         step0: on offer side, set tracks and create and set description
         step1: on offer side, when ice gathering completed, send SDP to answer side
@@ -11,82 +41,105 @@ export class WebRTCBase{
         step3: on answer side, when ice gathering completed, send SDP to offer side
         step4: on offer side, recieve answer SDP and set it to RTCPeerConnection.
     */
-    constructor(role, callbacks){
-        if(role == WebRTCRole.offer){
-            if( !['sendOfferSDP', ].every((f) => f in callbacks) )
-                throw "some callbacks needed for offer side are missing";
-        }else{
-            if( !['sendAnswerSDP', ].every((f) => f in callbacks) )
-                throw "some callbacks needed for answer side are missing";
-        }
+    constructor(role, signaling){
+        if( !['sendDescription', 'remoteDescription'].every((f) => f in signaling) )
+            throw "some callbacks needed are missing";
+
+        super();
 
         this.role = role;
-        this.callbacks = callbacks;
-        this.connection = new RTCPeerConnection();
+        this.signaling = signaling
 
-        this.connection.onicegatheringstatechange = () => {
-            if(this.connection.iceGatheringState != "complete")
-                return;
+        // イベントロギング
+        if('onconnectionstatechange' in this)
+            this.addEventListener('connectionstatechange', (ev) =>{
+                console.debug('RTCPeerConnection: connection state change:', this.connectionState);
+            });
+        this.addEventListener('icecandidate', (ev) =>{
+            console.debug('RTCPeerConnection: icecandidate:', ev.candidate);
+        });
+        this.addEventListener('iceconnectionstatechange', (ev) =>{
+            console.debug('RTCPeerConnection: ice connection state change:', this.iceConnectionState);
+        });
+        this.addEventListener('icegatheringstatechange', (ev) =>{
+            console.debug('RTCPeerConnection: ice gathering state change:', this.iceGatheringState);
+        });
+        this.addEventListener('signalingstatechange', (ev) =>{
+            console.debug('RTCPeerConnection: signaling state change:', this.signalingState);
+        });
+        this.addEventListener('datachannel', (ev) =>{
+            console.debug('RTCPeerConnection: datachannel:', ev);
+        });
+        this.addEventListener('track', (ev) =>{
+            console.debug('RTCPeerConnection: track:', ev);
+        });
+    }
 
-            if(this.role == WebRTCRole.offer){
-                // step 1
-                this.callbacks.sendOfferSDP(this.connection.localDescription['sdp']);
-            }
-            else{
-                // step 3
-                this.callbacks.sendAnswerSDP(this.connection.localDescription['sdp'])
+    async start(){
+        const waitIceGatheringComplete = new Promise((successed) => {
+            const onicegatheringstatechange = () => {
+                if(this.iceGatheringState != "complete")
+                    return;
+
+                this.removeEventListener('icegatheringstatechange', onicegatheringstatechange);
+
+                successed();
+            };
+            this.addEventListener('icegatheringstatechange', onicegatheringstatechange);
+        });
+
+        // 接続の確立後、SDP を再交換する際に使う datachannel
+        this.sdpchannel = this.createDataChannel(WebRTCBase.#sdpdatachannellabel, WebRTCBase.#sdpdatachanneloptions);
+
+        const onnegotiationneeded = async (ev) => {
+            // some track or data channel was added = offer side
+            console.debug('RTCPeerConnection: negotiation needed:');
+
+            await this.setLocalDescription();
+            this.sdpchannel.send(JSON.stringify(this.localDescription));
+        };
+        this.sdpchannel.onopen = (ev) => {
+            this.addEventListener('negotiationneeded', onnegotiationneeded);
+        };
+        this.sdpchannel.onclosing = (ev) => {
+            this.removeEventListener('negotiationneeded', onnegotiationneeded);
+        };
+        this.sdpchannel.onmessage = async (ev) => {
+            const remoteDesc = new RTCSessionDescription(JSON.parse(ev.data));
+            await this.setRemoteDescription(remoteDesc);
+
+            if('offer' == remoteDesc.type){
+                // answer side
+                await this.setLocalDescription();
+                this.sdpchannel.send(JSON.stringify(this.localDescription));
             }
         };
 
-        this.connection.ontrack = (ev) =>{
-            console.debug('WebRTCBase: ontrack callback:', ev);
+        if(this.role.isOffer){
+            // kick ice gathering
+            await this.setLocalDescription();
 
-            if(! ('receivedMediaStreams' in this.callbacks) )
-                return;
+            await waitIceGatheringComplete;
 
-            if (ev.streams && ev.streams.length > 0) {
-                callbacks.receivedMediaStreams(ev.streams);
-            } else {
-                const mediastream = new MediaStream();
-                mediastream.addTrack(ev.track);
-                callbacks.receivedMediaStreams([mediastream]);
-            }
+            this.signaling.sendDescription({
+                type: this.localDescription.type,
+                sdp: this.localDescription.sdp,
+            });
         }
-    }
+        
+        const remoteDesc = await this.signaling.remoteDescription();
+        await this.setRemoteDescription(new RTCSessionDescription(remoteDesc));
 
-    startOffer(...tracks){
-        // step 0
-        if(tracks.length == 0)
-            throw "Error: least one track is needed for offer";
+        if(this.role.isAnswer){
+            // kick ice gathering
+            await this.setLocalDescription();
 
-        tracks = tracks.flat(3);
+            await waitIceGatheringComplete;
 
-        // peer に送信する track を RTCPeerConnection に登録
-        tracks.forEach((e) => this.connection.addTrack(e))
-
-        // offer SDP を取得して、RTCPeerConnection に登録
-        // この時点で送信側の ICE の収集が走り始め、完了したらイベントハンドラがキックされる
-        this.connection.createOffer().then(desc => this.connection.setLocalDescription(desc))
-    }
-
-    receivedRemoteSDP(sdp){
-        if(this.role == WebRTCRole.answer){
-            // step2
-            const remoteDesc = new RTCSessionDescription({ sdp: sdp, type: 'offer' })
-            this.connection.setRemoteDescription(remoteDesc)
-
-            // answer SDP を作成して、RTCPeerConnection に登録
-            // この時点で受信側の ICE の収集が走り始め、完了したら onicegatheringstatechange がキックされる
-            this.connection.createAnswer().then(desc => this.connection.setLocalDescription(desc));
+            this.signaling.sendDescription({
+                type: this.localDescription.type,
+                sdp: this.localDescription.sdp,
+            });
         }
-        else{
-            // step4
-            const remoteDesc = new RTCSessionDescription({ sdp: sdp, type: 'answer' })
-            this.connection.setRemoteDescription(remoteDesc)
-        }
-    }
-
-    setOntrack(cb){
-        this.connection.ontrack = cb;
     }
 }
