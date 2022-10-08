@@ -16,54 +16,179 @@
     along with this program.  If not, see <https://www.gnu.org/licenses/>.
  **************************************************************************/
 
-import { initializeApp } from 'firebase/app';
-import { getFirestore, doc, setDoc, deleteDoc, onSnapshot, Timestamp } from 'firebase/firestore';
+import { getFirestore, doc, setDoc, deleteDoc, onSnapshot, Timestamp, collection } from 'firebase/firestore';
 
-const offer_collection_name = "description_offer";
-const answer_collection_name = "description_answer";
+const top_collection = 'WebRTCSignaling';
+const center_id = 'connection_center';
 
-export function createFirestoreSignaling(role, key, firebaseConfig){
-    const firebase = initializeApp(firebaseConfig);
-    const db = getFirestore(firebase);
+function generateSelfID(){
+    return Math.random().toString(36).substring(2);
+}
+export class FirestoreSignaling {
+    #firestore = null;
+    #answerResolvs = {};
 
-    let collection_names = null;
-    if(role.isOffer)
-        collection_names = [offer_collection_name, answer_collection_name];
-    else
-        collection_names = [answer_collection_name, offer_collection_name];
+    constructor(key, offeredcallback, isCenter=false, appendix=undefined){
+        this.isCenter = isCenter;
+        this.key = key;
+        if(isCenter)
+            this.id = center_id;
+        else
+            this.id = generateSelfID();
 
-    return {
-        async sendDescription(description){
-            console.debug('firestore signaling: sendOffer called');
+        this.#firestore = getFirestore();
 
-			await setDoc(doc(db, collection_names[0], key), {
-				type: description.type,
-                sdp: description.sdp,
-                lifelimit: Timestamp.fromMillis(Date.now() + 86400 * 1000), // 1日後, for TTL
-			});
-        },
-        remoteDescription(){
-            const peerdocument = doc(db, collection_names[1], key);
+        this.appendix = appendix;
 
-            return new Promise((resolve, reject) => {
-                const unsubscribe = onSnapshot(peerdocument, (document) => {
-                    const data = document.data();
-                    console.debug("firestore signaling: snapshot:", data);
+        if(isCenter){ // このセッションの有効期限を設定
+            setDoc(doc(this.#firestore, top_collection, this.key),
+                {
+                    lifelimit: Timestamp.fromMillis(Date.now() + 86400 * 1000), // 1日後, for TTL
+                }, {
+                    merge: true,
+                }
+            );
+        }
 
-                    if(!data)
-                        return
+        const mycollection = collection(this.#firestore,
+            top_collection, // collection
+            this.key,            // document
+            this.id              // collection
+        );
 
-                    if( !('type' in data) )
-                        return
-                    if( !('sdp' in data) )
-                        return
+        this.unsubscribe = onSnapshot(mycollection, (snapshot) => {
+            snapshot.docChanges().forEach((changed) => {
+                if(changed.type !== 'added')
+                    return;
+                
+                const data = changed.doc.data();
 
-                    unsubscribe(); // firestore の変更通知を止める
-                    deleteDoc(peerdocument); // 受信して用済みなので削除
+                if(!data) return;
+                if( !('type' in data)) return;
+                if( !('sdp' in data)) return;
 
-                    resolve({type: data.type, sdp: data.sdp})
-                });
+                console.debug('FirestoreSignaling: added document:', data.type, 'SDP from', changed.doc.id)
+
+                if(data.type == 'offer'){
+                    offeredcallback(changed.doc.id, data);
+                }else{ // answer backed to my offer from peer
+                    if( !(changed.doc.id in this.#answerResolvs)){
+                        console.log('FirestoreSignaling: unknonw answer received from', changed.doc.id);
+                        return;
+                    }
+
+                    this.#answerResolvs[changed.doc.id]({
+                        description: {
+                            type: data.type,
+                            sdp: data.sdp,
+                        },
+                        appendix: data.appendix,
+                        peerid: changed.doc.id,
+                    });
+                    delete this.#answerResolvs[changed.doc.id];
+                }
+
+                deleteDoc(changed.doc.ref);
+            })
+        })
+    }
+
+    getOfferSignalingToCenter(){
+        return this.getOffersTo(center_id)
+    }
+    getOfferSignalingTo(peer){
+        return (description) => {
+            const retval = new Promise((resolve) => {
+                this.#answerResolvs[peer] = resolve;
             });
-        },
+
+            const document = doc(this.#firestore,
+                top_collection, // collection
+                this.key,            // document
+                peer,                // collection
+                this.id              // document
+            );
+            sendToPeer(document, description, this.appendix)
+
+            return retval;
+        };
+    }
+
+    answerTo(peer, description){
+        const document = doc(this.#firestore,
+            top_collection, // collection
+            this.key,       // document
+            peer,           // collection
+            this.id         // document
+        );
+
+        return sendToPeer(document, description, this.appendix)
+    }
+}
+
+function getFromPeer(peerdocument){
+    return new Promise((resolve, failed) => {
+        try{
+            const unsubscribe = onSnapshot(peerdocument, (document) => {
+                const data = document.data();
+                console.debug("firestore signaling: snapshot:", data);
+
+                if( !data ) return;
+                if( !('type' in data) ) return;
+                if( !('sdp' in data) ) return;
+
+                unsubscribe(); // firestore の変更通知を止める
+                deleteDoc(peerdocument); // 受信して用済みなので削除
+
+                resolve({
+                    description: {
+                        type: data.type,
+                        sdp: data.sdp,
+                    },
+                    appendix: data.appendix,
+                    peerid: document.id,
+                })
+            });
+        }catch(e){
+            failed(e);
+        }
+    });
+}
+
+function sendToPeer(document, description, appendix){
+    const data = {
+        type: description.type,
+        sdp: description.sdp,
     };
+    if(appendix)
+        data['appendix'] = appendix;
+
+    return setDoc(document, data);
+}
+
+export function getSimpleOfferSignalingTo(key, peer, appendix){
+    const myid = generateSelfID();
+    const firestore = getFirestore();
+
+    console.debug("getSimpleOfferSignalingTo(): myid is ", myid)
+    return (description) => {
+        const retval = getFromPeer(doc(firestore, top_collection, key, myid, peer));
+
+        sendToPeer(doc(firestore, top_collection, key, peer, myid), description, appendix);
+
+        return retval;
+    };
+}
+
+export async function waitForOfferSignalingFrom(key, peer){
+    const myid = generateSelfID();
+    const firestore = getFirestore();
+
+    console.debug("waitForOfferSignalingFrom:() myid is ", myid)
+    const data = await getFromPeer(doc(firestore, top_collection, key, myid, peer));
+
+    data['answerSignaling'] = (description, appendix) => {
+        return sendToPeer(doc(firestore, top_collection, key, peer, myid), description, appendix);
+    };
+    return data;
 }
